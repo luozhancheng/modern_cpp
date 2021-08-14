@@ -1,4 +1,6 @@
 #include <iostream>
+#include "ray_remote.h"
+
 using namespace std;
 
 int main() {
