@@ -93,7 +93,7 @@ inline static int RegisterRF(const T &t, U... u) {
     const auto func_names = GetFunctionNames(t);
     (void)std::initializer_list<int>{
         (RegisterRF(std::string(func_names[index].data(),
-                                   func_names[index].length()), u),
+                                    func_names[index].length()), u),
                                            index++, 0)...};
     return 0;
 }
