@@ -10,6 +10,19 @@
 #include <boost/callable_traits.hpp>
 #include <boost/optional.hpp>
 
+template<typename>
+struct RemoveReference;
+
+template<class... T>
+struct RemoveReference<std::tuple<T...>> {
+    using type = std::tuple<std::remove_const_t<std::remove_reference_t<T>>...>;
+};
+
+template<class Tuple>
+using RemoveReference_t = typename RemoveReference<Tuple>::type;
+
+
+
 template<class Dest, class Source>
 Dest BitCast(const Source &source) {
     static_assert(sizeof(Dest) == sizeof(Source),
@@ -104,7 +117,25 @@ public:
         msgpack::unpack(unpacked, data, size);
         return unpacked.get().as<T>();
     }
+
+    template <typename T>
+    static std::pair<bool, T> DeserializeWhenNil(const char *data, size_t size) {
+        T val;
+        size_t off = 0;
+        msgpack::unpacked unpacked = msgpack::unpack(data, size, off);
+        if (!unpacked.get().convert_if_not_nil(val)) {
+            return {false, {}};
+        }
+
+        return {true, val};
+    }
 };
+
+template<typename T>
+inline static std::enable_if_t<!std::is_pointer<T>::value, msgpack::sbuffer>
+PackReturnValue(T result) {
+    return Serializer::Serialize(std::move(result));
+}
 
 class Arguments {
 public:
@@ -128,6 +159,25 @@ public:
     }
 };
 
+template<typename T>
+static inline T ParseArg(char *data, size_t size, bool &is_ok) {
+    auto pair = Serializer::DeserializeWhenNil<T>(data, size);
+    is_ok = pair.first;
+    return pair.second;
+}
+
+template<size_t... I, typename... Args>
+static inline bool GetArgsTuple(std::tuple<Args...> &tp,
+                                const std::vector<msgpack::sbuffer> &args_buffer,
+                                std::index_sequence<I...>) {
+    bool is_ok = true;
+    (void) std::initializer_list<int>{
+            (std::get<I>(tp) = ParseArg<Args>((char *) args_buffer.at(I).data(),
+                                              args_buffer.at(I).size(), is_ok),
+                    0)...};
+    return is_ok;
+}
+
 template<typename F>
 class TaskCaller {
 public:
@@ -149,7 +199,7 @@ public:
         }
 
         auto ret_buf = (*f)(args_buffer);
-        ReturnType a;
+        ReturnType a = Serializer::Deserialize<ReturnType>(ret_buf.data(), ret_buf.size());
         return a;
     }
 
@@ -200,12 +250,45 @@ inline static std::vector<std::string_view> GetFunctionNames(std::string_view st
     return output;
 }
 
+template<typename R, typename F, size_t... I, typename... Args>
+static R CallInternal(const F &f, const std::index_sequence<I...> &,
+                      std::tuple<Args...> args) {
+    (void) args;
+    using ArgsTuple = boost::callable_traits::args_t<F>;
+    return f(((typename std::tuple_element<I, ArgsTuple>::type) std::get<I>(args))...);
+}
+
+template<typename R, typename F, typename... Args>
+static std::enable_if_t<!std::is_void<R>::value, msgpack::sbuffer> Call(
+        const F &f, std::tuple<Args...> args) {
+    auto r =
+            CallInternal<R>(f, std::make_index_sequence<sizeof...(Args)>{}, std::move(args));
+    return PackReturnValue(r);
+}
+
+
+template <typename R, typename F, typename... Args>
+static std::enable_if_t<std::is_void<R>::value, msgpack::sbuffer> Call(
+        const F &f, std::tuple<Args...> args) {
+    CallInternal<R>(f, std::make_index_sequence<sizeof...(Args)>{}, std::move(args));
+    return Serializer::Serialize(msgpack::type::nil_t());
+}
+
 template<typename Function>
 static inline msgpack::sbuffer Apply(const Function &func,
                                      const std::vector<msgpack::sbuffer> &args_buffer) {
     auto func_name = GetFunctionName(func);
     std::cout << "Apply a function: " << func_name << std::endl;
+
+    using RetrunType = boost::callable_traits::return_type_t<Function>;
+    using ArgsTuple = RemoveReference_t<boost::callable_traits::args_t<Function>>;
+
     msgpack::sbuffer result;
+    ArgsTuple tp{};
+    bool is_ok = GetArgsTuple(
+            tp, args_buffer, std::make_index_sequence<std::tuple_size<ArgsTuple>::value>{});
+
+    result = Call<RetrunType>(func, std::move(tp));
     return result;
 }
 
@@ -261,7 +344,8 @@ namespace ray_remote {
     public:
         Test() {
             std::cout << "testing ray remote!" << std::endl;
-            auto task_obj = Task(sub).Remote(3, 1);
+            auto result = Task(sub).Remote(3, 1);
+            std::cout << "result = " << result << std::endl;
         }
     };
 
